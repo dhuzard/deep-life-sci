@@ -30,7 +30,6 @@ from typing import Any
 from langchain_core.messages import AIMessage
 
 from deep_life_sci.agent import build_agent
-from deep_life_sci.middleware.source_trace import ResearchTrace, research_trace
 from deep_life_sci.sandbox import sandbox_session
 from deep_life_sci.sources import cache_io
 
