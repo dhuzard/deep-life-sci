@@ -34,8 +34,6 @@ from typing import Any
 from langchain_core.tools import BaseTool
 from langgraph.config import get_stream_writer
 
-from deep_life_sci.middleware.source_trace import record_source_call
-
 # Matched by `isProgressEvent` in the chat UI's Stream.tsx. UI messages ride the same channel
 # and are told apart by this field, so it may not collide with theirs (`"ui"`).
 EVENT_TYPE = "progress"
