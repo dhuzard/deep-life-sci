@@ -26,3 +26,4 @@ async def test_trace_keeps_identifiers_but_not_scientific_payloads():
     assert data["pmids"] == ["123", "456"]
     assert data["events"][0]["requested_ids"] == ["123", "456"]
     assert "payload" not in repr(data)
+
