@@ -8,13 +8,14 @@ that's where this agent's regressions actually show up.
 costs a model call; drop it from the list for a fast structural-only sweep.
 """
 
-from evals.evaluators.citations import citations_exist
+from evals.evaluators.citations import citations_exist, citations_retrieved_this_run
 from evals.evaluators.deliverables import produced_expected_artifacts
 from evals.evaluators.judge import rubric_judge
 
 # Cheap, deterministic, no model calls.
 STRUCTURAL = [
     citations_exist,
+    citations_retrieved_this_run,
     produced_expected_artifacts,
 ]
 
@@ -24,6 +25,7 @@ __all__ = [
     "DEFAULT",
     "STRUCTURAL",
     "citations_exist",
+    "citations_retrieved_this_run",
     "produced_expected_artifacts",
     "rubric_judge",
 ]

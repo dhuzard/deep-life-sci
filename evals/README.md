@@ -29,10 +29,11 @@ scalars (`|-`) keep them readable in the file and byte-exact in what the judge i
 | evaluator | reads | catches |
 |---|---|---|
 | `citations_exist` | answer text + `data/abstracts/` | invented PMIDs |
+| `citations_retrieved_this_run` | answer text + run `source_trace` | citations to papers whose content this run never read |
 | `produced_expected_artifacts` | `ui` state key | "plot the distribution" answered in prose |
 | `rubric_judge` | answer text + published artifact names | confident, fluent, wrong — missing denominators, silent omissions |
 
-The first two are deterministic and free. Only `rubric_judge` costs a model call, and it
+The first three are deterministic and free. Only `rubric_judge` costs a model call, and it
 runs on the cheap half of the model pair. `--structural` drops it.
 
 **`produced_expected_artifacts` is why `runner.py` exists.** Artifact names are not
@@ -42,7 +43,7 @@ nothing about it.
 
 ## Scoring conventions
 
-**All three evaluators are boolean.** They return `score: True`/`False`. The SDK accepts
+**Scored evaluator verdicts are boolean.** They return `score: True`/`False`. The SDK accepts
 that (`SCORE_TYPE` puts `StrictBool` ahead of the numeric types) but LangSmith's score
 column is numeric and coerces on ingestion — verified by writing `score=True` and reading
 back `1.0`. So the stored metric is a float that only ever takes 0.0 or 1.0, and its mean
@@ -52,9 +53,10 @@ is exactly a pass rate. The boolean is the *decision*, not the storage type.
 round-trips as a string), but it carries no number, so the per-column aggregate goes away.
 Not worth the trade here.
 
-Booleans because every fraction these could return was misleading. `citations_exist`
-requires *all* cited PMIDs to resolve: one invented citation in twenty is the whole point
-of the check, and 0.95 sorts next to a clean run while reading as a rounding error. The
+Booleans because every fraction these could return was misleading. Both citation checks
+require *all* cited PMIDs to satisfy their criterion: one invented or unread citation in
+twenty is the whole point of the check, and 0.95 sorts next to a clean run while reading
+as a rounding error. The
 judge's rubrics are already written as pass/fail clauses, and a graded score let it split
 the difference — 0.75 on a four-clause rubric with no way to tell which clause failed.
 What used to be in the fraction is now in `comment`: the missing PMIDs, the absent
@@ -72,11 +74,11 @@ judge also returns `None` when its own output won't parse — including when it 
 a number instead of a verdict — because a judge failure and a bad answer must not look the
 same in the numbers.
 
-An **errored run** is that same kind of event and is scored `None` by all three, via the
-one guard in `evaluators/_guard.py`. `run.py:target` returns agent failures rather than
+An **errored run** is that same kind of event and is scored `None` by every evaluator,
+via the one guard in `evaluators/_guard.py`. `run.py:target` returns agent failures rather than
 raising them, so a dead run otherwise arrives looking like a real one with an empty answer
-— and without the guard the three evaluators each drew a different, wrong conclusion from
-that, one of them reading it as *not applicable* and raising its own aggregate. `None`
+— and without the guard the evaluators drew different, wrong conclusions from that,
+including reading failures as *not applicable* and raising an aggregate. `None`
 keeps them out of the aggregates, and `run.py` prints the errored seeds and a count so they
 cannot hide there instead.
 
@@ -98,9 +100,11 @@ different questions and neither substitutes for the other: `tests/` holds the co
 docstrings, this holds the agent to its answers. `tests/test_evals.py` covers the scoring
 conventions on this page, including the checked-in seed files.
 
-- **Misattribution.** `citations_exist` proves a PMID was fetched, not that it supports
-  the claim it's attached to. The cache is also shared across every run on the machine,
-  so a paper fetched by an earlier run passes. That gap is the judge's job.
+- **Claim attribution.** `citations_exist` proves identifier/cache validity and
+  `citations_retrieved_this_run` proves that source content was accessed in this run.
+  Neither proves that the cited source supports the claim attached to it. The rubric
+  judge can catch seeded answer errors, but there is no dedicated claim-to-source
+  grounding evaluator yet.
 - **Retrieval quality.** Nothing scores whether the search returned the *right* corpus,
   only what the agent did with what it got.
 - **Reference answers.** The seeds carry rubrics, not gold answers. Literature questions

@@ -3,12 +3,12 @@
 Three rules from `evals/README.md` are the ones worth defending, and all three are about
 what a *number* means rather than about whether an evaluator runs:
 
-* **All three evaluators are boolean.** Every fraction they could return was misleading —
-  0.95 on `citations_exist` sorts next to a clean run while reading as a rounding error,
-  and one invented citation in twenty is the whole point of the check.
+* **Scored evaluator verdicts are boolean.** Every fraction they could return was
+  misleading — 0.95 on a citation check sorts next to a clean run while reading as a
+  rounding error, and one bad citation in twenty is the whole point of the check.
 * **`score: None` means not applicable, not `False`.** A question with no required
   artifact is excluded from that evaluator's aggregate rather than given a free pass.
-* **An errored run is scored `None` by all three.** Without the guard, a batch that died
+* **An errored run is scored `None` by every evaluator.** Without the guard, a batch that died
   on infrastructure reads as a quality regression — or, worse, as an improvement, because
   one evaluator dropped the dead run from its own denominator.
 """
@@ -25,7 +25,11 @@ import yaml
 from evals import dataset_name, dataset_prefix
 from evals.evaluators import DEFAULT, STRUCTURAL
 from evals.evaluators._guard import scores_only_completed_runs
-from evals.evaluators.citations import citations_exist, cited_pmids
+from evals.evaluators.citations import (
+    citations_exist,
+    citations_retrieved_this_run,
+    cited_pmids,
+)
 from evals.evaluators.deliverables import _KINDS, produced_expected_artifacts
 from evals.evaluators.judge import _as_bool
 from evals.sync import DATASETS_DIR, _load, _split
@@ -134,6 +138,61 @@ class TestCitationsExist:
         assert citations_exist(_run(answer=""), _example())["key"] == "citations_exist"
 
 
+class TestCitationsRetrievedThisRun:
+    def test_passes_when_every_cited_pmid_was_read_in_this_run(self):
+        result = citations_retrieved_this_run(
+            _run(
+                answer="see PMID: 33567185",
+                source_trace={"pmids": ["33567185"]},
+            ),
+            _example(),
+        )
+        assert result["score"] is True
+        assert "1/1 cited PMIDs" in result["comment"]
+
+    def test_old_cache_cannot_make_an_unread_citation_pass(self, abstract_cache, monkeypatch):
+        """Persistent cache membership and current-run retrieval are different claims."""
+        monkeypatch.setattr(
+            "evals.evaluators.citations.ABSTRACT_CACHE", abstract_cache
+        )
+        (abstract_cache / "33567185.json").write_text("{}")
+        run = _run(
+            answer="see PMID: 33567185",
+            source_trace={"pmids": []},
+        )
+
+        assert citations_exist(run, _example())["score"] is True
+        result = citations_retrieved_this_run(run, _example())
+        assert result["score"] is False
+        assert "33567185" in result["comment"]
+
+    def test_missing_trace_is_unscoreable_not_a_false_citation_failure(self):
+        result = citations_retrieved_this_run(
+            _run(answer="see PMID: 33567185"),
+            _example(),
+        )
+        assert result["score"] is None
+        assert "did not expose source_trace.pmids" in result["comment"]
+
+    def test_an_answer_citing_nothing_is_not_applicable(self):
+        result = citations_retrieved_this_run(
+            _run(answer="No papers were cited.", source_trace={"pmids": []}),
+            _example(),
+        )
+        assert result["score"] is None
+
+    def test_the_verdict_is_boolean_when_trace_is_available(self):
+        result = citations_retrieved_this_run(
+            _run(
+                answer="PMID: 33567185 and PMID: 99999999",
+                source_trace={"pmids": ["33567185"]},
+            ),
+            _example(),
+        )
+        assert isinstance(result["score"], bool)
+        assert result["score"] is False
+
+
 class TestProducedExpectedArtifacts:
     def test_passes_when_the_expected_kind_was_published(self):
         result = produced_expected_artifacts(
@@ -211,6 +270,14 @@ class TestErroredRunGuard:
         assert result["score"] is None
         assert "sandbox boot timeout" in result["comment"]
 
+    def test_the_guard_covers_current_run_citations_too(self):
+        result = citations_retrieved_this_run(
+            _run(answer="PMID: 33567185", error="boom"),
+            _example(),
+        )
+        assert result["score"] is None
+        assert "run failed" in result["comment"]
+
     def test_the_guard_covers_the_artifact_evaluator_too(self):
         """Without it, a dead run reads as a missing deliverable."""
         result = produced_expected_artifacts(
@@ -255,7 +322,11 @@ class TestErroredRunGuard:
 
 class TestEvaluatorRegistry:
     def test_the_structural_evaluators_cost_no_model_call(self):
-        assert len(STRUCTURAL) == 2
+        assert [e.__name__ for e in STRUCTURAL] == [
+            "citations_exist",
+            "citations_retrieved_this_run",
+            "produced_expected_artifacts",
+        ]
         assert all(e.__name__ != "rubric_judge" for e in STRUCTURAL)
 
     def test_the_judge_is_listed_last_so_it_can_be_dropped(self):
