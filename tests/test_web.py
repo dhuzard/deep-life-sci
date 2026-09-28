@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from deep_life_sci.models import web_search_problem
 from deep_life_sci.sources import web
 from deep_life_sci.sources.web import (
     MAX_ANSWER_CHARS,
@@ -295,10 +296,34 @@ class TestWebSearchTool:
         monkeypatch.setenv("SEARCH_EFFORT", "")
         result = await web_search.ainvoke({"query": "what did the FDA approve?"})
         assert result["answer"] == ""
-        (warning,) = result["warnings"]
-        assert "web search unavailable" in warning
+        # Exactly the reason, not the generic failure's guesses at a 400 or a filter.
+        assert result["warnings"] == [f"web search unavailable: {web_search_problem()}"]
         model = "bedrock/us.anthropic.claude-sonnet-5"
-        assert f"SEARCH_MODEL='{model}' cannot be the search model" in warning
+        assert f"SEARCH_MODEL='{model}' cannot be the search model" in result["warnings"][0]
+
+    async def test_a_setting_that_stopped_working_mid_run_is_contained(self, monkeypatch):
+        """models.yaml hot-reloads; a SystemExit out of a PTC tool ends the server's loop."""
+        def refused():
+            raise SystemExit("models.yaml search.provider='bedrock' is not a gateway path.")
+
+        monkeypatch.setattr(web, "web_search_model", refused)
+        result = await web_search.ainvoke({"query": "what did the FDA approve?"})
+        assert result["warnings"] == [
+            "web search unavailable: models.yaml search.provider='bedrock' is not a gateway path."
+        ]
+
+    async def test_a_failure_is_reported_even_if_the_setting_changed_during_it(self, monkeypatch):
+        class Failing:
+            async def ainvoke(self, _prompt):
+                raise ValueError("gateway said no")
+
+        def refused(*_roles):
+            raise SystemExit("models.yaml search.provider='bedrock' is not a gateway path.")
+
+        monkeypatch.setattr(web, "web_search_model", lambda: Failing())
+        monkeypatch.setattr(web, "describe", refused)
+        result = await web_search.ainvoke({"query": "what did the FDA approve?"})
+        assert result["warnings"][0].startswith("web search unavailable: search failed: gateway")
 
     async def test_a_model_that_cannot_be_built_is_contained_too(self, monkeypatch):
         def unbuildable():

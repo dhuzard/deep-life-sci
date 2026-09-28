@@ -24,9 +24,10 @@ Each role is configured by three independent env vars, defaulting to the role's 
 provider's own server-side web search bound to it, called from inside the tool so its
 output lands in the JS heap rather than in root context. It is a role of its own rather
 than a reuse of `subagent` because web search is the one capability that is not uniform
-across ids — the spec differs per gateway path (`WEB_SEARCH_SPECS`), a leaf swap must not
-be able to take the tool out with it, and one search legitimately runs 4x longer than the
-30s a leaf gets (`SEARCH_TIMEOUT_SECONDS`).
+across ids — the spec differs per gateway path (`WEB_SEARCH_SPECS`) and, on Bedrock, per
+model (`_web_search_spec`), a leaf swap must not be able to take the tool out with it,
+and one search legitimately runs 4x longer than the 30s a leaf gets
+(`SEARCH_TIMEOUT_SECONDS`).
 
 Three axes rather than one named profile because they vary independently, and a name that
 covers combinations needs one entry per combination — a root swap, a leaf swap and a
@@ -65,7 +66,6 @@ that as its warning (`_web_search_spec`).
 """
 
 import os
-import re
 import threading
 from pathlib import Path
 from typing import NamedTuple, get_args
@@ -170,24 +170,28 @@ WEB_SEARCH_SPECS = {
     # Needs the Responses API, which `_build` already sets on this path — Chat
     # Completions has no server-side web search at all.
     "openai": {"type": "web_search"},
-    # Bedrock's own search, for its GPT models on the Responses API (`_web_search_spec`).
-    # Same tool type as OpenAI's. `external_web_access: False` keeps retrieval inside
-    # Bedrock's index and cache: left at its default, every page fetch fails unless the
-    # key's IAM identity also holds `bedrock-websearch:ExternalWebAccess`, which
-    # AmazonBedrockFullAccess does not grant, and the answer degrades without saying so.
-    "bedrock": {"type": "web_search", "external_web_access": False},
 }
+
+# Bedrock's own search, for its GPT models on the OpenAI-compatible path, which it takes
+# in place of that path's spec (`_web_search_spec`). Same tool type as OpenAI's.
+# `external_web_access: False` keeps retrieval inside Bedrock's index and cache: left at
+# its default, every page fetch fails unless the key's IAM identity also holds
+# `bedrock-websearch:ExternalWebAccess`, which AmazonBedrockFullAccess does not grant, and
+# the answer degrades without saying so.
+_BEDROCK_WEB_SEARCH_SPEC = {"type": "web_search", "external_web_access": False}
 
 # The two gateway paths, which is all a provider selects here — see the module docstring.
 # `anthropic` is the Anthropic Messages format, `openai` the OpenAI-compatible one; Bedrock
 # is a vendor reached through either (see `_bedrock_parts`), not a path of its own.
 PROVIDERS = ("anthropic", "openai")
 
-# Bedrock models on its web search, by bare id prefix. Claude has none on Bedrock.
-_BEDROCK_SEARCH_MODELS = ("gpt-5.4", "gpt-5.5", "gpt-5.6")
+# Bedrock's web search serves its GPT models from this version on, by bare id (so
+# `gpt-5.7-luna` and `gpt-6` pass, `gpt-oss-120b` does not). Claude has none on Bedrock.
+_BEDROCK_SEARCH_MIN_GPT = (5, 4)
 
-# Cross-region inference profiles prefix a Bedrock id with where it may run.
-_BEDROCK_REGION_PREFIX = re.compile(r"^(?:us|eu|apac|jp|au|ca|global|us-gov)\.")
+# The Bedrock model makers whose ids change anything here: Claude takes the anthropic path,
+# and GPT models are the only ones with Bedrock's web search.
+_BEDROCK_MAKERS = ("anthropic", "openai")
 
 # Why models.yaml's defaults are what they are. Kept here rather than in the file a user
 # edits, so that file stays short.
@@ -424,16 +428,50 @@ def _bedrock_parts(model: str) -> tuple[str, str] | None:
     ("anthropic", "claude-sonnet-4-5-20250929"), `bedrock/openai.gpt-5.6-terra` is
     ("openai", "gpt-5.6-terra"). The bare id is what the maker's langchain profile is
     keyed by, and the maker decides the gateway path.
+
+    The maker is found by name rather than by stripping known regions, so a new region
+    prefix needs no change here, and an ARN is read by the profile or model id it ends in.
+    Only `_BEDROCK_MAKERS` are named; any other id, like `bedrock/amazon.nova-pro-v1:0`, is
+    ("", the id).
     """
     vendor, _, rest = model.partition("/")
     if vendor != "bedrock" or not rest:
         return None
-    maker, _, name = _BEDROCK_REGION_PREFIX.sub("", rest).partition(".")
-    return (maker, re.sub(r"-v\d+(?::\d+)?$", "", name)) if name else ("", maker)
+    name = rest.rpartition("/")[2]
+    for maker in _BEDROCK_MAKERS:
+        if name.startswith(f"{maker}."):
+            bare = name.removeprefix(f"{maker}.")
+        elif f".{maker}." in name:
+            bare = name.partition(f".{maker}.")[2]
+        else:
+            continue
+        return maker, _without_version(bare)
+    return "", name
+
+
+def _without_version(bare: str) -> str:
+    """A Bedrock model name without its `-v1` or `-v1:0` version suffix."""
+    stem, sep, version = bare.rpartition("-v")
+    number, _, revision = version.partition(":")
+    if sep and number.isdigit() and (not revision or revision.isdigit()):
+        return stem
+    return bare
+
+
+def _bedrock_names_no_model(model: str) -> bool:
+    """A `bedrock/` id with no `maker.model` in it, which only AWS can resolve.
+
+    An application inference profile's ARN ends in an opaque id
+    (`.../application-inference-profile/a1b2c3d4e5f6`), so nothing here can tell Claude
+    from GPT behind it; the id's form says nothing, and the provider setting decides.
+    """
+    parts = _bedrock_parts(model)
+    return parts is not None and not parts[0] and "." not in parts[1]
 
 
 def _is_bedrock_claude(model: str) -> bool:
-    return (_bedrock_parts(model) or ("",))[0] == "anthropic"
+    parts = _bedrock_parts(model)
+    return parts is not None and parts[0] == "anthropic"
 
 
 def _infer_provider(model: str) -> str:
@@ -447,8 +485,11 @@ def _infer_provider(model: str) -> str:
     Claude on Bedrock (`bedrock/...anthropic.claude-...`) is the exception: it takes the
     Anthropic Messages format through the gateway's standard endpoint, which keeps what
     only `ChatAnthropic` does — prompt caching through `cache_control`, and effort mapped
-    to `output_config` — where the OpenAI-compatible path would drop the first.
+    to `output_config` — where the OpenAI-compatible path would drop the first. A Bedrock
+    id that names no model says nothing (`_bedrock_names_no_model`).
     """
+    if _bedrock_names_no_model(model):
+        return ""
     if "/" in model:
         return "anthropic" if _is_bedrock_claude(model) else "openai"
     if model.startswith("claude-"):
@@ -484,9 +525,13 @@ def _provider_for(
                 f"{provider_source}={declared!r} is not a gateway path. "
                 f"Choose one of: {', '.join(PROVIDERS)}"
             )
-        # Bedrock Claude also works on the OpenAI-compatible path, only without caching,
-        # so naming that path is a choice rather than a contradiction.
-        if inferred and inferred != declared and not _is_bedrock_claude(model):
+        if inferred and inferred != declared and _is_bedrock_claude(model):
+            raise SystemExit(
+                f"{model_source}={model!r} is Claude on Bedrock, which takes the anthropic "
+                f"path, but {provider_source} says {declared!r}. The OpenAI-compatible path "
+                "drops its prompt caching. Unset the provider, or set it to anthropic."
+            )
+        if inferred and inferred != declared:
             raise SystemExit(
                 f"{model_source}={model!r} is a {inferred!r} id but {provider_source} "
                 f"says {declared!r}. The paths take different id forms: anthropic wants a "
@@ -514,6 +559,12 @@ def _setting(role: str, axis: str) -> str:
     """
     value = os.environ.get(f"{role.upper()}_{axis.upper()}", "").strip()
     return value or _config().defaults[role][axis]
+
+
+def _model_source(role: str) -> str:
+    """Where `_setting(role, "model")` came from, for messages that name the line to fix."""
+    name = f"{role.upper()}_MODEL"
+    return name if os.environ.get(name, "").strip() else f"models.yaml {role}.model"
 
 
 def _effort(role: str) -> str:
@@ -554,17 +605,22 @@ def _profile_levels(model: str, provider: str) -> tuple[str, ...] | None:
         vendor = "anthropic"
     if bedrock := _bedrock_parts(model):
         vendor, bare = bedrock
+    levels = _default_profile(vendor, bare).get("reasoning_effort_levels")
+    return tuple(levels) if levels else None
+
+
+def _default_profile(vendor: str, bare: str) -> dict:
+    """langchain's model profile for a vendor's bare id, or {} for any other vendor or id."""
     try:
         if vendor == "openai":
             from langchain_openai.chat_models.base import _get_default_model_profile
         elif vendor == "anthropic":
             from langchain_anthropic.chat_models import _get_default_model_profile
         else:
-            return None
-        levels = (_get_default_model_profile(bare) or {}).get("reasoning_effort_levels")
+            return {}
+        return _get_default_model_profile(bare) or {}
     except Exception:  # noqa: BLE001 - a private helper; if it moves, there is no profile
-        return None
-    return tuple(levels) if levels else None
+        return {}
 
 
 def _anthropic_efforts() -> tuple[str, ...]:
@@ -632,8 +688,8 @@ def _resolve(role: str) -> tuple[str, str, str]:
     """
     upper, defaults = role.upper(), _config().defaults[role]
     model = _setting(role, "model")
-    from_env = bool(os.environ.get(f"{upper}_MODEL", "").strip())
-    model_source = f"{upper}_MODEL" if from_env else f"models.yaml {role}.model"
+    model_source = _model_source(role)
+    from_env = model_source == f"{upper}_MODEL"
     provider = os.environ.get(f"{upper}_PROVIDER", "").strip().lower()
     provider_source = f"{upper}_PROVIDER"
     if not provider:
@@ -663,7 +719,7 @@ class WebSearchUnavailable(ValueError):
     """
 
 
-def _web_search_spec(model: str, provider: str, source: str = "SEARCH_MODEL") -> dict:
+def _web_search_spec(model: str, provider: str) -> dict:
     """The server-side web search tool for the search role's model, or why it has none.
 
     The spec follows the vendor, not only the path: Bedrock serves GPT models on the
@@ -674,30 +730,52 @@ def _web_search_spec(model: str, provider: str, source: str = "SEARCH_MODEL") ->
     if bedrock is None:
         return WEB_SEARCH_SPECS[provider]
     maker, bare = bedrock
-    if maker == "openai" and bare.startswith(_BEDROCK_SEARCH_MODELS):
-        return WEB_SEARCH_SPECS["bedrock"]
+    if maker == "openai" and (_gpt_version(bare) or (0, 0)) >= _BEDROCK_SEARCH_MIN_GPT:
+        return _BEDROCK_WEB_SEARCH_SPEC
     raise WebSearchUnavailable(
-        f"{source}={model!r} cannot be the search model: Bedrock's web search runs only on "
-        f"its OpenAI GPT models ({', '.join(m + '*' for m in _BEDROCK_SEARCH_MODELS)}, e.g. "
+        f"{_model_source('search')}={model!r} cannot be the search model: Bedrock's web "
+        "search runs only on its OpenAI GPT models from GPT-5.4 on (e.g. "
         "'bedrock/openai.gpt-5.6-luna', in us-east-1, us-east-2 or us-west-2), and Claude "
         "has no server-side search on Bedrock. Use one of those, or a model on OpenAI or "
         "Anthropic directly."
     )
 
 
+def _gpt_version(bare: str) -> tuple[int, int] | None:
+    """(major, minor) of a GPT model name: `gpt-5.6-luna` is (5, 6), `gpt-6` is (6, 0)."""
+    if not bare.startswith("gpt-"):
+        return None
+    major, _, minor = bare.removeprefix("gpt-").partition("-")[0].partition(".")
+    if major.isdigit() and (minor.isdigit() or not minor):
+        return int(major), int(minor or 0)
+    return None
+
+
 def web_search_problem() -> str | None:
     """Why the search role cannot search, or None. For a warning at startup, not a refusal."""
     model, provider, _ = _resolve("search")
     try:
-        _web_search_spec(model, provider, _source_of("search", "model"))
+        _web_search_spec(model, provider)
     except WebSearchUnavailable as exc:
         return str(exc)
     return None
 
 
-def _source_of(role: str, axis: str) -> str:
-    name = f"{role.upper()}_{axis.upper()}"
-    return name if os.environ.get(name, "").strip() else f"models.yaml {role}.{axis}"
+_reported_search_problem: str | None = None
+
+
+def report_web_search_problem() -> None:
+    """Log `web_search_problem()` once per distinct reason, on every graph build.
+
+    Per build because models.yaml hot-reloads: a check only at server start misses an edit
+    that takes search out, and the CLI and evals never start the server. Once per reason
+    because reads build the graph too, on every page of a thread's history.
+    """
+    global _reported_search_problem
+    problem = web_search_problem()
+    if problem and problem != _reported_search_problem:
+        print(f"[models] warning: web search is unavailable. {problem}")
+    _reported_search_problem = problem
 
 
 def validate(*roles: str) -> None:
@@ -715,9 +793,18 @@ def _messages_base_url(model: str) -> str:
     appends `/v1/messages` either way.
     """
     if "/" not in model:
-        return os.environ.get("LANGSMITH_GATEWAY_ANTHROPIC_URL", ANTHROPIC_BASE_URL)
-    base = os.environ.get("LANGSMITH_GATEWAY_BASE_URL", OPENAI_BASE_URL).rstrip("/")
+        return _gateway_url("LANGSMITH_GATEWAY_ANTHROPIC_URL", ANTHROPIC_BASE_URL)
+    base = _gateway_url("LANGSMITH_GATEWAY_BASE_URL", OPENAI_BASE_URL).rstrip("/")
     return base.removesuffix("/v1")
+
+
+def _gateway_url(name: str, default: str) -> str:
+    """A gateway URL from the environment, else the default.
+
+    Whitespace reads as unset, as in `gateway_key`: both SDKs treat an empty base URL as
+    none and fall back to the provider's own API, which would send it the LangSmith key.
+    """
+    return os.environ.get(name, "").strip() or default
 
 
 def _build(model: str, provider: str, **kwargs):
@@ -733,6 +820,14 @@ def _build(model: str, provider: str, **kwargs):
         # ChatOpenAI takes the components as they are, so only this path collapses them.
         if isinstance(timeout := kwargs.get("timeout"), httpx.Timeout):
             kwargs["timeout"] = timeout.read
+        # langchain-anthropic keys its profiles by bare id, so a Bedrock id matches none,
+        # and without one ChatAnthropic caps output at 4096 tokens and leaves thinking off
+        # when effort is set. It is the same model, so it takes the bare id's profile.
+        # `max_tokens` too: ChatAnthropic reads that default from the model name alone.
+        if (bedrock := _bedrock_parts(model)) and (profile := _default_profile(*bedrock)):
+            kwargs.setdefault("profile", profile)
+            if max_output := profile.get("max_output_tokens"):
+                kwargs.setdefault("max_tokens", max_output)
         return ChatAnthropic(
             model=model,
             base_url=_messages_base_url(model),
@@ -744,7 +839,7 @@ def _build(model: str, provider: str, **kwargs):
 
     return ChatOpenAI(
         model=model,
-        base_url=os.environ.get("LANGSMITH_GATEWAY_BASE_URL", OPENAI_BASE_URL),
+        base_url=_gateway_url("LANGSMITH_GATEWAY_BASE_URL", OPENAI_BASE_URL),
         api_key=key,
         # Chat Completions cannot carry an image, and `read_file` on a figure returns one:
         # a tool result is a `tool`-role message whose content is text, so the block goes
@@ -808,8 +903,9 @@ def web_search_model(**kwargs):
     """The `search` role, with the provider's server-side web search already bound.
 
     Returns a Runnable rather than a bare chat model, because which spec to bind is
-    decided by the resolved gateway path (see `WEB_SEARCH_SPECS`) and that resolution
-    lives here. `sources/web.py` therefore never has to know which provider it is on.
+    decided by the resolved gateway path and the model behind it (see `_web_search_spec`)
+    and that resolution lives here. `sources/web.py` therefore never has to know which
+    provider it is on.
 
     Binding in this module is also what keeps a provider swap from silently sending the
     wrong spec: `SEARCH_PROVIDER` is an env axis like every other, so a hard-coded spec
@@ -822,7 +918,7 @@ def web_search_model(**kwargs):
     kwargs.setdefault("timeout", SEARCH_TIMEOUT_SECONDS)
     if effort:
         kwargs.setdefault("reasoning_effort", effort)
-    spec = _web_search_spec(model, provider, _source_of("search", "model"))
+    spec = _web_search_spec(model, provider)
     return _build(model, provider, **kwargs).bind_tools([spec])
 
 
