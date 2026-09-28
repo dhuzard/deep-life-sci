@@ -21,7 +21,13 @@ from deep_life_sci.middleware.perf import LoopLagProbe
 from deep_life_sci.middleware.progress import with_progress
 from deep_life_sci.middleware.tool_errors import with_error_capture
 from deep_life_sci.middleware.uploads import UploadMiddleware
-from deep_life_sci.models import CHAT_ROLES, root_model, subagent_model, validate
+from deep_life_sci.models import (
+    CHAT_ROLES,
+    report_web_search_problem,
+    root_model,
+    subagent_model,
+    validate,
+)
 from deep_life_sci.prompts import (
     ABSTRACT_ANALYST,
     DOCUMENT_ANALYST,
@@ -41,7 +47,10 @@ def build_agent(backend):
     """Assemble the agent against a backend. In practice the backend is the sandbox."""
     # Every chat role, including search, which is otherwise first resolved inside a tool
     # call: a setting that cannot work fails here, before the run, naming what to fix.
+    # A search model that cannot search is the exception: it takes out only web search,
+    # so it is logged rather than refused, and each web search returns the reason.
     validate(*CHAT_ROLES)
+    report_web_search_problem()
     # Built per-run: these upload bytes into the sandbox, so an image exists as a real
     # file on a real path before a subagent can read_file it.
     fetch_figures, fetch_supplementary = make_sandbox_tools(backend)
