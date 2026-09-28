@@ -4,7 +4,7 @@
 # prefix (e.g. openai/gpt-5.6-terra)
 
 # Effort must be a level the model supports; leave it empty to omit it
-# This is required for models with no effort setting)
+# This is required for models with no effort setting
 
 # Provider API keys go in LangSmith under Settings -> Integrations -> Provider Secrets
 

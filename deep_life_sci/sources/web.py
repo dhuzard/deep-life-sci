@@ -213,6 +213,18 @@ def _warnings(blocks: list[dict], answer: str) -> list[str]:
     return out
 
 
+def _search_setting() -> str:
+    """`describe('search')` for a failure message, never raising in place of the failure.
+
+    The setting can change mid-call into one that cannot work, and `describe` then raises
+    SystemExit; that is the next call's warning, not this one's.
+    """
+    try:
+        return describe("search")
+    except SystemExit:
+        return "search"
+
+
 @tool
 async def web_search(query: str) -> dict:
     """Search the web and return a written digest with the URLs behind it.
@@ -252,14 +264,16 @@ async def web_search(query: str) -> dict:
             message = await model.ainvoke(
                 _PROMPT.format(today=date.today().isoformat(), query=query)
             )
-    except WebSearchUnavailable as exc:
-        # The search model cannot search at all, so every call will say the same thing;
-        # the message already names the setting and what works instead.
+    except (WebSearchUnavailable, SystemExit) as exc:
+        # The search model cannot search at all, or the setting cannot work: models.yaml
+        # hot-reloads, so an edit mid-run reaches here after this run's checks passed, and a
+        # SystemExit out of a PTC tool ends the server's event loop rather than this call.
+        # Either message already names the setting and what works instead.
         return _failed(query, str(exc))
     except Exception as exc:  # noqa: BLE001 - a failed search must not kill the run
         return _failed(
             query,
-            f"{describe('search')} failed: {exc}. Not every model supports its provider's "
+            f"{_search_setting()} failed: {exc}. Not every model supports its provider's "
             "server-side web search, and a provider content filter can reject a query "
             "outright; if this is a 400, one of those is the likely cause.",
         )
