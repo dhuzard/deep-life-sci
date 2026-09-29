@@ -244,20 +244,20 @@ const { records: full } = await tools.fetchFullText({
 
 Full text is ~40× an abstract, so read it yourself only when the user asked about one
 specific paper. For anything across papers, fan out `full-text-analyst` subagents exactly
-as you do for abstracts — one per paper, one `Promise.all`, the text in the prompt:
+as you do for abstracts — one per paper, one `Promise.all`, the text in the prompt, and
+`readEvidence` (defined under "Asking a question of many papers") for the result:
 
 ```js
-const answers = await Promise.all(Object.values(full).map(async (r) => ({
-  pmcid: r.pmcid, pmid: r.pmid, title: r.title, retracted: r.retracted,
-  answer: await task({
-    description: `Question: ${question}\n\nTitle: ${r.title}\nPMCID: ${r.pmcid}\n\n${r.text}`,
-    subagentType: "full-text-analyst",
-  }),
-})));
+const answers = await Promise.all(Object.values(full).map((r) => readEvidence(
+  { kind: "pmc_full_text", pmcid: r.pmcid, pmid: r.pmid, title: r.title,
+    retracted: r.retracted },
+  `Question: ${question}\n\nTitle: ${r.title}\nPMCID: ${r.pmcid}\n\n${r.text}`,
+  "full-text-analyst",
+)));
 await tools.writeFile({
   file_path: "/workspace/answers.json", content: JSON.stringify(answers),
 });
-answers.map(a => ({ pmid: a.pmid, answer: a.answer })); // projection, not the whole array
+answers.map(evidenceSummary); // projection, not the whole array
 ```
 
 ### Reading figures
@@ -792,31 +792,68 @@ Dispatch every paper in a single `Promise.all`, not in successive batches. A cor
 concurrently and each one is small. Splitting the fan-out across several `eval` calls
 just adds a slow round trip through the orchestrator for no benefit.
 
+Abstract and full-text analysts return a structured extraction, not free text. Declare
+these helpers as written (they stay in scope for later calls) and dispatch through
+`readEvidence`:
+
 ```js
+const evidenceSchema = {
+  title: "EvidenceExtraction", type: "object", additionalProperties: false,
+  required: ["status", "finding", "locator", "excerpt", "limitations"],
+  properties: {
+    status: { type: "string", enum: ["supported", "not_addressed", "insufficient"],
+      description: "supported: the text answers the question. not_addressed: it does " +
+        "not. insufficient: it is too truncated or incomplete to tell." },
+    finding: { type: "string", description: "The answer in one or two sentences." },
+    locator: { type: "string", description: 'Section, figure or table label, or "none".' },
+    excerpt: { type: "string", description: 'Short verbatim quote, or "none".' },
+    limitations: { type: "string", description: 'Caveats that bear on it, or "none".' },
+  },
+};
+// `source` comes from the fetched record. The analyst never supplies identifiers, and
+// only the schema's fields are kept from its reply. Don't wrap `task` in try/catch: a
+// caught rejection loses its message, which you need if it is a gateway error.
+const readEvidence = async (source, description, subagentType) => {
+  const out = await task({ description, subagentType, responseSchema: evidenceSchema });
+  if (!evidenceSchema.properties.status.enum.includes(out?.status) ||
+      !evidenceSchema.required.every((k) => typeof out[k] === "string")) {
+    return { source, error: "analyst returned no valid extraction" };
+  }
+  const extraction = {};
+  for (const k of evidenceSchema.required) extraction[k] = out[k];
+  return { source, extraction };
+};
+const evidenceSummary = ({ source, extraction: x, error }) => ({
+  ...(source.pmcid ? { pmcid: source.pmcid } : {}), pmid: source.pmid,
+  ...(x ? { status: x.status, finding: x.finding, locator: x.locator,
+            limitations: x.limitations } : { error }),
+});
+
 const { records } = await tools.fetchAbstracts({ pmids });
 const question = "Did this study use an in vivo mouse model?";
 
 const answers = await Promise.all(
   Object.values(records)
     .filter(r => r.abstract)
-    .map(async (r) => ({
-      pmid: r.pmid,
-      title: r.title,
-      retracted: r.retracted,
-      answer: await task({
-        description:
-          `Question: ${question}\n\n` +
-          `Title: ${r.title}\nPMID: ${r.pmid}\n\nAbstract:\n${r.abstract}`,
-        subagentType: "abstract-analyst",
-      }),
-    }))
+    .map((r) => readEvidence(
+      { kind: "pubmed_abstract", pmid: r.pmid, title: r.title, retracted: r.retracted },
+      `Question: ${question}\n\n` +
+        `Title: ${r.title}\nPMID: ${r.pmid}\n\nAbstract:\n${r.abstract}`,
+      "abstract-analyst",
+    ))
 );
 await tools.writeFile({
   file_path: "/workspace/answers.json", content: JSON.stringify(answers),
 });
-// Return only the fields you will actually cite, not the whole objects.
-answers.map(a => ({ pmid: a.pmid, answer: a.answer }));
+// Return only the fields you will actually cite; excerpts stay in answers.json.
+answers.map(evidenceSummary);
 ```
+
+Cite the identifiers in `source`, never ones an analyst wrote in its text. `supported`
+means the analyst extracted an answer from that source, not that your synthesis claim is
+verified. `not_addressed` means the source is silent, and `insufficient` is a coverage gap
+to report, not evidence either way. An `error` is an unusable reply: do not count it as
+any of the three, and say how many reads it affected.
 
 **Every fan-out ends with a `writeFile` of the full answers and a projection of them as
 the return value.** Keep the fields synthesis needs and drop the rest. Anything you left 
@@ -839,7 +876,7 @@ string. Union types like `["string", "null"]` are rejected and abort the whole f
 for a field that may not apply, use `type: "string"` and tell the subagent to answer
 `"none"`.
 
-Keep the `pmid` alongside each answer as above, so citations can't drift. Then
+Keep each extraction beside its fetched `source` as above, so citations can't drift. Then
 synthesize from the projection you returned: note where the abstracts disagree or are
 silent, and report with PMIDs. Counting and grouping come from Python over
 `answers.json` — do not return the rows so you can tally them by hand. Prefer one `eval`
